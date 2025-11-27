@@ -10,8 +10,14 @@ import "mapbox-gl/dist/mapbox-gl.css";
 import "@mapbox/mapbox-gl-draw/dist/mapbox-gl-draw.css";
 import "@mapbox/mapbox-gl-geocoder/dist/mapbox-gl-geocoder.css";
 
-interface PolygonMeasurement {
+// Types for our hierarchical structure
+type PolygonType = "area" | "mz" | "sp";
+
+interface PolygonData {
   id: string;
+  type: PolygonType;
+  name: string;
+  parentId: string | null; // Areas have no parent, MZs have area parent, SPs have MZ parent
   area: number;
   perimeter: number;
   width: number;
@@ -26,6 +32,13 @@ interface MapboxMapProps {
   initialZoom?: number;
 }
 
+// Colors for different polygon types
+const POLYGON_COLORS = {
+  area: { fill: "#3b82f6", stroke: "#1d4ed8" }, // Blue
+  mz: { fill: "#22c55e", stroke: "#16a34a" }, // Green
+  sp: { fill: "#f59e0b", stroke: "#d97706" }, // Orange/Amber
+};
+
 export default function MapboxMap({
   accessToken,
   initialCenter = [-74.5, 40],
@@ -35,33 +48,52 @@ export default function MapboxMap({
   const map = useRef<mapboxgl.Map | null>(null);
   const draw = useRef<MapboxDraw | null>(null);
 
-  const [polygons, setPolygons] = useState<PolygonMeasurement[]>([]);
+  // Refs to track current drawing context (used in event handlers)
+  const drawingTypeRef = useRef<PolygonType>("area");
+  const selectedParentIdRef = useRef<string | null>(null);
+
+  const [polygons, setPolygons] = useState<PolygonData[]>([]);
   const [selectedPolygonId, setSelectedPolygonId] = useState<string | null>(null);
-  const [selectedVertexIndex, setSelectedVertexIndex] = useState<number | null>(null);
   const [isDrawing, setIsDrawing] = useState(false);
   const [isDirectSelectMode, setIsDirectSelectMode] = useState(false);
+  const [drawingType, setDrawingType] = useState<PolygonType>("area");
+  const [selectedParentId, setSelectedParentId] = useState<string | null>(null);
+  const [validationError, setValidationError] = useState<string | null>(null);
+
+  // Get polygons by type
+  const areas = polygons.filter((p) => p.type === "area");
+  const monitoringZones = polygons.filter((p) => p.type === "mz");
+  const samplePlots = polygons.filter((p) => p.type === "sp");
+
+  // Get MZs for a specific area
+  const getMZsForArea = (areaId: string) =>
+    monitoringZones.filter((mz) => mz.parentId === areaId);
+
+  // Get SPs for a specific MZ
+  const getSPsForMZ = (mzId: string) =>
+    samplePlots.filter((sp) => sp.parentId === mzId);
 
   const calculatePolygonMeasurements = useCallback(
-    (feature: GeoJSON.Feature<GeoJSON.Polygon>): PolygonMeasurement => {
+    (
+      feature: GeoJSON.Feature<GeoJSON.Polygon>,
+      type: PolygonType,
+      parentId: string | null,
+      existingName?: string
+    ): PolygonData => {
       const coordinates = feature.geometry.coordinates[0];
       const polygon = turf.polygon([coordinates]);
 
-      // Calculate area in square meters
       const area = turf.area(polygon);
-
-      // Calculate perimeter in meters
       const perimeter = turf.length(turf.lineString(coordinates), {
         units: "meters",
       });
 
-      // Calculate bounding box for width and height
       const bbox = turf.bbox(polygon);
       const minLng = bbox[0];
       const minLat = bbox[1];
       const maxLng = bbox[2];
       const maxLat = bbox[3];
 
-      // Width (east-west distance at the center latitude)
       const centerLat = (minLat + maxLat) / 2;
       const width = turf.distance(
         turf.point([minLng, centerLat]),
@@ -69,7 +101,6 @@ export default function MapboxMap({
         { units: "meters" }
       );
 
-      // Height (north-south distance at the center longitude)
       const centerLng = (minLng + maxLng) / 2;
       const height = turf.distance(
         turf.point([centerLng, minLat]),
@@ -77,18 +108,138 @@ export default function MapboxMap({
         { units: "meters" }
       );
 
+      // Generate name based on type and count
+      const typeLabels = { area: "Area", mz: "Monitoring Zone", sp: "Sample Plot" };
+      const existingOfType = polygons.filter((p) => p.type === type);
+      const name = existingName || `${typeLabels[type]} ${existingOfType.length + 1}`;
+
       return {
         id: feature.id as string,
+        type,
+        name,
+        parentId,
         area,
         perimeter,
         width,
         height,
-        vertices: coordinates.length - 1, // Subtract 1 because first and last are the same
+        vertices: coordinates.length - 1,
         coordinates,
       };
     },
-    []
+    [polygons]
   );
+
+  // Check if polygon overlaps with others of the same type
+  const checkOverlap = useCallback(
+    (
+      newCoords: number[][],
+      type: PolygonType,
+      excludeId?: string
+    ): boolean => {
+      const newPolygon = turf.polygon([newCoords]);
+      const sameTypePolygons = polygons.filter(
+        (p) => p.type === type && p.id !== excludeId
+      );
+
+      for (const existing of sameTypePolygons) {
+        const existingPolygon = turf.polygon([existing.coordinates]);
+        const intersection = turf.intersect(
+          turf.featureCollection([newPolygon, existingPolygon])
+        );
+        if (intersection) {
+          return true; // Overlap detected
+        }
+      }
+      return false;
+    },
+    [polygons]
+  );
+
+  // Check if polygon is within parent boundary
+  const checkWithinParent = useCallback(
+    (newCoords: number[][], parentId: string): boolean => {
+      const parent = polygons.find((p) => p.id === parentId);
+      if (!parent) return false;
+
+      const newPolygon = turf.polygon([newCoords]);
+      const parentPolygon = turf.polygon([parent.coordinates]);
+
+      return turf.booleanContains(parentPolygon, newPolygon);
+    },
+    [polygons]
+  );
+
+  // Validate new polygon
+  const validatePolygon = useCallback(
+    (
+      coords: number[][],
+      type: PolygonType,
+      parentId: string | null,
+      excludeId?: string
+    ): { valid: boolean; error: string | null } => {
+      // Check overlap with same type
+      if (checkOverlap(coords, type, excludeId)) {
+        const typeLabels = { area: "Areas", mz: "Monitoring Zones", sp: "Sample Plots" };
+        return {
+          valid: false,
+          error: `${typeLabels[type]} cannot overlap with each other`,
+        };
+      }
+
+      // Check containment for MZ and SP
+      if (type === "mz" && parentId) {
+        if (!checkWithinParent(coords, parentId)) {
+          return {
+            valid: false,
+            error: "Monitoring Zone must be completely within the selected Area",
+          };
+        }
+      }
+
+      if (type === "sp" && parentId) {
+        if (!checkWithinParent(coords, parentId)) {
+          return {
+            valid: false,
+            error: "Sample Plot must be completely within the selected Monitoring Zone",
+          };
+        }
+      }
+
+      return { valid: true, error: null };
+    },
+    [checkOverlap, checkWithinParent]
+  );
+
+  // Helper to calculate measurements only - defined before updatePolygonsList
+  const calculateMeasurementsOnly = useCallback((coordinates: number[][]) => {
+    const polygon = turf.polygon([coordinates]);
+    const area = turf.area(polygon);
+    const perimeter = turf.length(turf.lineString(coordinates), {
+      units: "meters",
+    });
+
+    const bbox = turf.bbox(polygon);
+    const minLng = bbox[0];
+    const minLat = bbox[1];
+    const maxLng = bbox[2];
+    const maxLat = bbox[3];
+
+    const centerLat = (minLat + maxLat) / 2;
+    const width = turf.distance(
+      turf.point([minLng, centerLat]),
+      turf.point([maxLng, centerLat]),
+      { units: "meters" }
+    );
+
+    const centerLng = (minLng + maxLng) / 2;
+    const height = turf.distance(
+      turf.point([centerLng, minLat]),
+      turf.point([centerLng, maxLat]),
+      { units: "meters" }
+    );
+
+    return { area, perimeter, width, height, vertices: coordinates.length - 1 };
+  }, []);
 
   const updatePolygonsList = useCallback(() => {
     if (!draw.current) return;
@@ -99,9 +250,29 @@ export default function MapboxMap({
         f.geometry.type === "Polygon"
     );
 
-    const measurements = polygonFeatures.map(calculatePolygonMeasurements);
-    setPolygons(measurements);
-  }, [calculatePolygonMeasurements]);
+    // Update existing polygons with new coordinates
+    setPolygons((prev) => {
+      const updated = prev.map((p) => {
+        const feature = polygonFeatures.find((f) => f.id === p.id);
+        if (feature) {
+          return {
+            ...p,
+            coordinates: feature.geometry.coordinates[0],
+            ...calculateMeasurementsOnly(feature.geometry.coordinates[0]),
+          };
+        }
+        return p;
+      });
+      return updated;
+    });
+  }, [calculateMeasurementsOnly]);
+
+  // Apply custom styles to polygons based on type
+  const applyPolygonStyles = useCallback(() => {
+    if (!map.current || !draw.current) return;
+
+    // This would require custom draw styles - for now we handle it via the draw config
+  }, []);
 
   useEffect(() => {
     if (!mapContainer.current || map.current) return;
@@ -115,44 +286,123 @@ export default function MapboxMap({
       zoom: initialZoom,
     });
 
-    // Initialize draw control with all editing modes
+    // Custom styles for draw
+    const drawStyles = [
+      // Polygon fill - active
+      {
+        id: "gl-draw-polygon-fill-active",
+        type: "fill",
+        filter: ["all", ["==", "active", "true"], ["==", "$type", "Polygon"]],
+        paint: {
+          "fill-color": "#fbb03b",
+          "fill-outline-color": "#fbb03b",
+          "fill-opacity": 0.3,
+        },
+      },
+      // Polygon fill - inactive
+      {
+        id: "gl-draw-polygon-fill-inactive",
+        type: "fill",
+        filter: ["all", ["==", "active", "false"], ["==", "$type", "Polygon"]],
+        paint: {
+          "fill-color": "#3bb2d0",
+          "fill-outline-color": "#3bb2d0",
+          "fill-opacity": 0.2,
+        },
+      },
+      // Polygon stroke - active
+      {
+        id: "gl-draw-polygon-stroke-active",
+        type: "line",
+        filter: ["all", ["==", "active", "true"], ["==", "$type", "Polygon"]],
+        paint: {
+          "line-color": "#fbb03b",
+          "line-width": 3,
+        },
+      },
+      // Polygon stroke - inactive
+      {
+        id: "gl-draw-polygon-stroke-inactive",
+        type: "line",
+        filter: ["all", ["==", "active", "false"], ["==", "$type", "Polygon"]],
+        paint: {
+          "line-color": "#3bb2d0",
+          "line-width": 2,
+        },
+      },
+      // Vertex points
+      {
+        id: "gl-draw-point",
+        type: "circle",
+        filter: ["all", ["==", "$type", "Point"]],
+        paint: {
+          "circle-radius": 6,
+          "circle-color": "#fff",
+          "circle-stroke-color": "#fbb03b",
+          "circle-stroke-width": 2,
+        },
+      },
+    ];
+
     draw.current = new MapboxDraw({
       displayControlsDefault: false,
       controls: {
-        polygon: true,
+        polygon: false,
         trash: true,
       },
       defaultMode: "simple_select",
+      styles: drawStyles,
     });
 
     map.current.addControl(draw.current, "top-left");
     map.current.addControl(new mapboxgl.NavigationControl(), "top-right");
 
-    // Add Geocoder (search) control
     const geocoder = new MapboxGeocoder({
       accessToken: accessToken,
       mapboxgl: mapboxgl,
       marker: true,
       placeholder: "Search address, place, or coordinates...",
       zoom: 17,
-      // Include all location types for full address search
-      // Note: "address" includes street-level results, "poi.landmark" for famous landmarks
       types: "country,region,postcode,district,place,locality,neighborhood,address,poi,poi.landmark",
     });
     map.current.addControl(geocoder, "top-left");
 
-    // Event handlers
-    map.current.on("draw.create", () => {
-      updatePolygonsList();
-      setIsDrawing(false);
-    });
+    // Event handlers - draw.create is handled in a separate useEffect to access current refs
 
     map.current.on("draw.update", () => {
       updatePolygonsList();
     });
 
-    map.current.on("draw.delete", () => {
-      updatePolygonsList();
+    map.current.on("draw.delete", (e: { features: GeoJSON.Feature[] }) => {
+      const deletedIds = e.features.map((f) => f.id as string);
+
+      setPolygons((prev) => {
+        // Also delete children
+        const toDelete = new Set(deletedIds);
+
+        // Find all children recursively
+        const findChildren = (parentIds: string[]) => {
+          const children = prev.filter((p) => parentIds.includes(p.parentId || ""));
+          if (children.length > 0) {
+            children.forEach((c) => toDelete.add(c.id));
+            findChildren(children.map((c) => c.id));
+          }
+        };
+
+        findChildren(deletedIds);
+
+        // Delete children from draw
+        if (draw.current) {
+          toDelete.forEach((id) => {
+            if (!deletedIds.includes(id)) {
+              draw.current?.delete(id);
+            }
+          });
+        }
+
+        return prev.filter((p) => !toDelete.has(p.id));
+      });
+
       setSelectedPolygonId(null);
     });
 
@@ -167,72 +417,130 @@ export default function MapboxMap({
     map.current.on("draw.modechange", (e: { mode: string }) => {
       setIsDrawing(e.mode === "draw_polygon");
       setIsDirectSelectMode(e.mode === "direct_select");
-      if (e.mode !== "direct_select") {
-        setSelectedVertexIndex(null);
-      }
-    });
-
-    // Track selected vertex in direct_select mode
-    map.current.on("click", () => {
-      if (draw.current) {
-        const selected = draw.current.getSelected();
-        if (selected.features.length > 0) {
-          const feature = selected.features[0];
-          // Check if we're in direct_select mode and have selected coordinates
-          const mode = draw.current.getMode();
-          if (mode === "direct_select" && feature.properties?.coord_path) {
-            const coordPath = feature.properties.coord_path;
-            const vertexIndex = parseInt(coordPath.split(".").pop() || "0", 10);
-            setSelectedVertexIndex(vertexIndex);
-          }
-        }
-      }
     });
 
     return () => {
       map.current?.remove();
       map.current = null;
     };
-  }, [accessToken, initialCenter, initialZoom, updatePolygonsList]);
+  }, [accessToken, initialCenter, initialZoom]);
 
-  const startDrawing = () => {
-    if (draw.current) {
-      draw.current.changeMode("draw_polygon");
-      setIsDrawing(true);
+  // Keep refs in sync with state
+  useEffect(() => {
+    drawingTypeRef.current = drawingType;
+  }, [drawingType]);
+
+  useEffect(() => {
+    selectedParentIdRef.current = selectedParentId;
+  }, [selectedParentId]);
+
+  // Set up draw.create handler once and use refs for current values
+  useEffect(() => {
+    if (!map.current) return;
+
+    const handleCreate = (e: { features: GeoJSON.Feature[] }) => {
+      const feature = e.features[0] as GeoJSON.Feature<GeoJSON.Polygon>;
+      if (!feature) return;
+
+      const coords = feature.geometry.coordinates[0];
+      const currentType = drawingTypeRef.current;
+      const currentParentId = selectedParentIdRef.current;
+
+      // Check for duplicates - if this polygon ID already exists, skip
+      setPolygons((prev) => {
+        if (prev.some((p) => p.id === feature.id)) {
+          return prev; // Already added, skip
+        }
+
+        const validation = validatePolygon(coords, currentType, currentParentId);
+
+        if (!validation.valid) {
+          if (draw.current) {
+            draw.current.delete(feature.id as string);
+          }
+          setValidationError(validation.error);
+          setTimeout(() => setValidationError(null), 5000);
+          return prev;
+        }
+
+        const newPolygon = calculatePolygonMeasurements(
+          feature,
+          currentType,
+          currentParentId
+        );
+
+        return [...prev, newPolygon];
+      });
+
+      setIsDrawing(false);
+    };
+
+    map.current.on("draw.create", handleCreate);
+
+    return () => {
+      map.current?.off("draw.create", handleCreate);
+    };
+  }, [validatePolygon, calculatePolygonMeasurements]);
+
+  const startDrawing = (type: PolygonType, parentId: string | null = null) => {
+    if (!draw.current) return;
+
+    // Validate parent selection
+    if (type === "mz" && !parentId) {
+      setValidationError("Please select an Area first to draw a Monitoring Zone");
+      setTimeout(() => setValidationError(null), 3000);
+      return;
     }
+
+    if (type === "sp" && !parentId) {
+      setValidationError("Please select a Monitoring Zone first to draw a Sample Plot");
+      setTimeout(() => setValidationError(null), 3000);
+      return;
+    }
+
+    setDrawingType(type);
+    setSelectedParentId(parentId);
+    draw.current.changeMode("draw_polygon");
+    setIsDrawing(true);
   };
 
-  const deleteSelectedPolygon = () => {
-    if (draw.current && selectedPolygonId) {
-      draw.current.delete(selectedPolygonId);
-      updatePolygonsList();
-      setSelectedPolygonId(null);
-    }
-  };
+  const deletePolygon = (id: string) => {
+    if (!draw.current) return;
 
-  const deleteAllPolygons = () => {
-    if (draw.current) {
-      draw.current.deleteAll();
-      updatePolygonsList();
-      setSelectedPolygonId(null);
-    }
+    // Find all children to delete
+    const toDelete = new Set([id]);
+    const findChildren = (parentIds: string[]) => {
+      const children = polygons.filter((p) => parentIds.includes(p.parentId || ""));
+      if (children.length > 0) {
+        children.forEach((c) => toDelete.add(c.id));
+        findChildren(children.map((c) => c.id));
+      }
+    };
+    findChildren([id]);
+
+    // Delete from draw
+    toDelete.forEach((deleteId) => {
+      draw.current?.delete(deleteId);
+    });
+
+    setPolygons((prev) => prev.filter((p) => !toDelete.has(p.id)));
+    setSelectedPolygonId(null);
   };
 
   const selectPolygon = (id: string) => {
     if (draw.current && map.current) {
-      draw.current.changeMode("direct_select", { featureId: id });
+      draw.current.changeMode("simple_select", { featureIds: [id] });
       setSelectedPolygonId(id);
 
-      // Zoom to the selected polygon
-      const feature = draw.current.get(id);
-      if (feature && feature.geometry.type === "Polygon") {
-        const bounds = turf.bbox(feature);
+      const polygon = polygons.find((p) => p.id === id);
+      if (polygon) {
+        const bounds = turf.bbox(turf.polygon([polygon.coordinates]));
         map.current.fitBounds(
           [
             [bounds[0], bounds[1]],
             [bounds[2], bounds[3]],
           ],
-          { padding: 50 }
+          { padding: 100 }
         );
       }
     }
@@ -240,7 +548,6 @@ export default function MapboxMap({
 
   const editPolygon = (id: string) => {
     if (draw.current) {
-      // Enter direct_select mode which allows vertex editing
       draw.current.changeMode("direct_select", { featureId: id });
       setSelectedPolygonId(id);
     }
@@ -281,22 +588,33 @@ export default function MapboxMap({
 
     const coordinates = [...feature.geometry.coordinates[0]];
 
-    // A polygon needs at least 4 points (3 vertices + closing point)
     if (coordinates.length <= 4) {
       alert("Cannot delete vertex: A polygon must have at least 3 vertices");
       return;
     }
 
-    // Remove the vertex at the specified index
     coordinates.splice(vertexIndex, 1);
 
-    // If we removed the first vertex, update the closing point to match the new first vertex
     if (vertexIndex === 0) {
       coordinates[coordinates.length - 1] = [...coordinates[0]];
     }
-    // If we removed the last point (before closing), that's fine as closing point remains
 
-    // Update the feature
+    const polygon = polygons.find((p) => p.id === polygonId);
+    if (polygon) {
+      const validation = validatePolygon(
+        coordinates,
+        polygon.type,
+        polygon.parentId,
+        polygonId
+      );
+
+      if (!validation.valid) {
+        setValidationError(validation.error);
+        setTimeout(() => setValidationError(null), 3000);
+        return;
+      }
+    }
+
     const updatedFeature = {
       ...feature,
       geometry: {
@@ -307,22 +625,40 @@ export default function MapboxMap({
 
     draw.current.add(updatedFeature as GeoJSON.Feature<GeoJSON.Geometry>);
     updatePolygonsList();
-    setSelectedVertexIndex(null);
 
-    // Re-enter direct_select mode
     draw.current.changeMode("direct_select", { featureId: polygonId });
   };
 
   const formatMeasurement = (value: number, unit: string): string => {
-    if (value >= 1000000) {
-      return `${(value / 1000000).toFixed(2)} km${unit === "m²" ? "²" : ""}`;
-    } else if (value >= 1000) {
-      return `${(value / 1000).toFixed(2)} ${unit === "m²" ? "km²" : "km"}`;
+    if (unit === "m²") {
+      if (value >= 1000000) {
+        return `${(value / 1000000).toFixed(2)} km²`;
+      } else if (value >= 10000) {
+        return `${(value / 10000).toFixed(2)} ha`;
+      }
+      return `${value.toFixed(2)} m²`;
     }
-    return `${value.toFixed(2)} ${unit}`;
+    if (value >= 1000) {
+      return `${(value / 1000).toFixed(2)} km`;
+    }
+    return `${value.toFixed(2)} m`;
   };
 
   const selectedPolygon = polygons.find((p) => p.id === selectedPolygonId);
+
+  const getTypeLabel = (type: PolygonType) => {
+    const labels = { area: "Area", mz: "Monitoring Zone", sp: "Sample Plot" };
+    return labels[type];
+  };
+
+  const getTypeColor = (type: PolygonType) => {
+    const colors = {
+      area: "bg-blue-500",
+      mz: "bg-green-500",
+      sp: "bg-amber-500",
+    };
+    return colors[type];
+  };
 
   return (
     <div className="flex h-screen w-full">
@@ -330,45 +666,96 @@ export default function MapboxMap({
       <div ref={mapContainer} className="flex-1 h-full" />
 
       {/* Sidebar */}
-      <div className="w-80 bg-white dark:bg-gray-900 border-l border-gray-200 dark:border-gray-700 overflow-y-auto">
+      <div className="w-96 bg-white dark:bg-gray-900 border-l border-gray-200 dark:border-gray-700 overflow-y-auto">
         <div className="p-4">
           <h2 className="text-xl font-bold mb-4 text-gray-900 dark:text-white">
-            Polygon Tools
+            Forest Mapping Tools
           </h2>
 
+          {/* Validation Error */}
+          {validationError && (
+            <div className="mb-4 p-3 bg-red-100 dark:bg-red-900/30 border border-red-400 dark:border-red-600 rounded-lg">
+              <p className="text-red-700 dark:text-red-300 text-sm font-medium">
+                {validationError}
+              </p>
+            </div>
+          )}
+
           {/* Drawing Controls */}
-          <div className="space-y-2 mb-6">
+          <div className="space-y-3 mb-6">
+            <div className="flex items-center gap-2">
+              <div className={`w-3 h-3 rounded-full ${getTypeColor("area")}`}></div>
+              <span className="text-sm font-medium text-gray-700 dark:text-gray-300">
+                Areas ({areas.length})
+              </span>
+            </div>
             <button
-              onClick={startDrawing}
+              onClick={() => startDrawing("area")}
               disabled={isDrawing}
-              className={`w-full px-4 py-2 rounded-lg font-medium transition-colors ${
-                isDrawing
-                  ? "bg-green-500 text-white cursor-not-allowed"
-                  : "bg-blue-500 hover:bg-blue-600 text-white"
-              }`}
+              className="w-full px-4 py-2 rounded-lg font-medium bg-blue-500 hover:bg-blue-600 text-white disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
             >
-              {isDrawing ? "Drawing..." : "Draw Polygon"}
+              {isDrawing && drawingType === "area" ? "Drawing Area..." : "Draw New Area"}
             </button>
 
-            <button
-              onClick={deleteSelectedPolygon}
-              disabled={!selectedPolygonId}
-              className="w-full px-4 py-2 rounded-lg font-medium bg-red-500 hover:bg-red-600 text-white disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            <div className="flex items-center gap-2 mt-4">
+              <div className={`w-3 h-3 rounded-full ${getTypeColor("mz")}`}></div>
+              <span className="text-sm font-medium text-gray-700 dark:text-gray-300">
+                Monitoring Zones ({monitoringZones.length})
+              </span>
+            </div>
+            <select
+              className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-white text-sm"
+              onChange={(e) => {
+                if (e.target.value) {
+                  startDrawing("mz", e.target.value);
+                }
+              }}
+              value=""
+              disabled={isDrawing || areas.length === 0}
             >
-              Delete Selected
-            </button>
+              <option value="">
+                {areas.length === 0
+                  ? "Draw an Area first"
+                  : "Select Area to add MZ..."}
+              </option>
+              {areas.map((area) => (
+                <option key={area.id} value={area.id}>
+                  {area.name}
+                </option>
+              ))}
+            </select>
 
-            <button
-              onClick={deleteAllPolygons}
-              disabled={polygons.length === 0}
-              className="w-full px-4 py-2 rounded-lg font-medium bg-gray-500 hover:bg-gray-600 text-white disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            <div className="flex items-center gap-2 mt-4">
+              <div className={`w-3 h-3 rounded-full ${getTypeColor("sp")}`}></div>
+              <span className="text-sm font-medium text-gray-700 dark:text-gray-300">
+                Sample Plots ({samplePlots.length})
+              </span>
+            </div>
+            <select
+              className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-white text-sm"
+              onChange={(e) => {
+                if (e.target.value) {
+                  startDrawing("sp", e.target.value);
+                }
+              }}
+              value=""
+              disabled={isDrawing || monitoringZones.length === 0}
             >
-              Delete All
-            </button>
+              <option value="">
+                {monitoringZones.length === 0
+                  ? "Draw a Monitoring Zone first"
+                  : "Select MZ to add Sample Plot..."}
+              </option>
+              {monitoringZones.map((mz) => (
+                <option key={mz.id} value={mz.id}>
+                  {mz.name}
+                </option>
+              ))}
+            </select>
 
             <button
               onClick={zoomToCurrentLocation}
-              className="w-full px-4 py-2 rounded-lg font-medium bg-purple-500 hover:bg-purple-600 text-white transition-colors"
+              className="w-full px-4 py-2 rounded-lg font-medium bg-purple-500 hover:bg-purple-600 text-white transition-colors mt-4"
             >
               📍 My Location
             </button>
@@ -380,22 +767,30 @@ export default function MapboxMap({
               Instructions
             </h3>
             <ul className="text-sm text-blue-700 dark:text-blue-300 space-y-1">
-              <li>• Click &quot;Draw Polygon&quot; to start</li>
-              <li>• Click on the map to add vertices</li>
+              <li>• First draw <strong>Areas</strong> (blue)</li>
+              <li>• Then add <strong>Monitoring Zones</strong> inside Areas (green)</li>
+              <li>• Finally add <strong>Sample Plots</strong> inside MZs (orange)</li>
+              <li>• Polygons of the same type cannot overlap</li>
               <li>• Double-click to finish drawing</li>
               <li>• Click a polygon to select it</li>
-              <li>• Drag vertices to edit shape</li>
-              <li>• Click on edge midpoints to add vertices</li>
-              <li>• Select a vertex and press Delete to remove it</li>
             </ul>
           </div>
 
           {/* Selected Polygon Details */}
           {selectedPolygon && (
-            <div className="mb-6 p-4 bg-green-50 dark:bg-green-900/30 rounded-lg">
-              <h3 className="font-semibold text-green-800 dark:text-green-200 mb-3">
-                Selected Polygon
-              </h3>
+            <div className="mb-6 p-4 bg-gray-50 dark:bg-gray-800 rounded-lg">
+              <div className="flex items-center gap-2 mb-3">
+                <div className={`w-3 h-3 rounded-full ${getTypeColor(selectedPolygon.type)}`}></div>
+                <h3 className="font-semibold text-gray-900 dark:text-white">
+                  {selectedPolygon.name}
+                </h3>
+              </div>
+              <p className="text-xs text-gray-500 dark:text-gray-400 mb-3">
+                Type: {getTypeLabel(selectedPolygon.type)}
+                {selectedPolygon.parentId && (
+                  <> • Parent: {polygons.find((p) => p.id === selectedPolygon.parentId)?.name}</>
+                )}
+              </p>
               <div className="space-y-2 text-sm">
                 <div className="flex justify-between">
                   <span className="text-gray-600 dark:text-gray-400">Width:</span>
@@ -428,95 +823,129 @@ export default function MapboxMap({
                   </span>
                 </div>
               </div>
-              <button
-                onClick={() => editPolygon(selectedPolygon.id)}
-                className={`w-full mt-3 px-4 py-2 rounded-lg font-medium transition-colors ${
-                  isDirectSelectMode
-                    ? "bg-green-600 text-white"
-                    : "bg-green-500 hover:bg-green-600 text-white"
-                }`}
-              >
-                {isDirectSelectMode ? "Editing Vertices" : "Edit Vertices"}
-              </button>
 
-              {/* Vertex List for Deletion */}
+              <div className="flex gap-2 mt-4">
+                <button
+                  onClick={() => editPolygon(selectedPolygon.id)}
+                  className="flex-1 px-3 py-2 rounded-lg font-medium bg-green-500 hover:bg-green-600 text-white text-sm transition-colors"
+                >
+                  Edit
+                </button>
+                <button
+                  onClick={() => deletePolygon(selectedPolygon.id)}
+                  className="flex-1 px-3 py-2 rounded-lg font-medium bg-red-500 hover:bg-red-600 text-white text-sm transition-colors"
+                >
+                  Delete
+                </button>
+              </div>
+
+              {/* Vertex editing */}
               {isDirectSelectMode && (
                 <div className="mt-4">
-                  <h4 className="font-medium text-green-800 dark:text-green-200 mb-2 text-sm">
-                    Vertices (click to delete)
+                  <h4 className="font-medium text-gray-800 dark:text-gray-200 mb-2 text-sm">
+                    Vertices
                   </h4>
-                  <div className="max-h-40 overflow-y-auto space-y-1">
+                  <div className="max-h-32 overflow-y-auto space-y-1">
                     {selectedPolygon.coordinates.slice(0, -1).map((coord, index) => (
                       <div
                         key={index}
-                        className="flex items-center justify-between p-2 bg-white dark:bg-gray-800 rounded text-xs"
+                        className="flex items-center justify-between p-2 bg-white dark:bg-gray-700 rounded text-xs"
                       >
                         <span className="text-gray-700 dark:text-gray-300">
-                          V{index + 1}: [{coord[0].toFixed(4)}, {coord[1].toFixed(4)}]
+                          V{index + 1}
                         </span>
                         <button
                           onClick={() => deleteVertex(selectedPolygon.id, index)}
                           disabled={selectedPolygon.vertices <= 3}
                           className="px-2 py-1 bg-red-500 hover:bg-red-600 text-white rounded disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                          title={selectedPolygon.vertices <= 3 ? "Minimum 3 vertices required" : "Delete vertex"}
                         >
                           ✕
                         </button>
                       </div>
                     ))}
                   </div>
-                  {selectedPolygon.vertices <= 3 && (
-                    <p className="mt-2 text-xs text-orange-600 dark:text-orange-400">
-                      Minimum 3 vertices required
-                    </p>
-                  )}
                 </div>
               )}
             </div>
           )}
 
-          {/* Polygons List */}
+          {/* Hierarchical Polygon List */}
           <div>
             <h3 className="font-semibold text-gray-900 dark:text-white mb-3">
-              Polygons ({polygons.length})
+              All Polygons
             </h3>
-            {polygons.length === 0 ? (
+
+            {areas.length === 0 ? (
               <p className="text-gray-500 dark:text-gray-400 text-sm">
-                No polygons drawn yet. Click &quot;Draw Polygon&quot; to start.
+                No areas drawn yet. Click &quot;Draw New Area&quot; to start.
               </p>
             ) : (
               <div className="space-y-2">
-                {polygons.map((polygon, index) => (
-                  <div
-                    key={polygon.id}
-                    onClick={() => selectPolygon(polygon.id)}
-                    className={`p-3 rounded-lg cursor-pointer transition-colors ${
-                      selectedPolygonId === polygon.id
-                        ? "bg-blue-100 dark:bg-blue-900/50 border-2 border-blue-500"
-                        : "bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700"
-                    }`}
-                  >
-                    <div className="flex justify-between items-center mb-2">
-                      <span className="font-medium text-gray-900 dark:text-white">
-                        Polygon {index + 1}
-                      </span>
-                      <span className="text-xs text-gray-500 dark:text-gray-400">
-                        {polygon.vertices} vertices
-                      </span>
-                    </div>
-                    <div className="text-xs text-gray-600 dark:text-gray-400 space-y-1">
-                      <div className="flex justify-between">
-                        <span>W × H:</span>
-                        <span>
-                          {formatMeasurement(polygon.width, "m")} ×{" "}
-                          {formatMeasurement(polygon.height, "m")}
+                {areas.map((area) => (
+                  <div key={area.id} className="space-y-1">
+                    {/* Area */}
+                    <div
+                      onClick={() => selectPolygon(area.id)}
+                      className={`p-3 rounded-lg cursor-pointer transition-colors border-l-4 border-blue-500 ${
+                        selectedPolygonId === area.id
+                          ? "bg-blue-100 dark:bg-blue-900/50"
+                          : "bg-gray-50 dark:bg-gray-800 hover:bg-gray-100 dark:hover:bg-gray-700"
+                      }`}
+                    >
+                      <div className="flex justify-between items-center">
+                        <span className="font-medium text-gray-900 dark:text-white text-sm">
+                          {area.name}
+                        </span>
+                        <span className="text-xs text-gray-500">
+                          {formatMeasurement(area.area, "m²")}
                         </span>
                       </div>
-                      <div className="flex justify-between">
-                        <span>Area:</span>
-                        <span>{formatMeasurement(polygon.area, "m²")}</span>
-                      </div>
                     </div>
+
+                    {/* MZs for this area */}
+                    {getMZsForArea(area.id).map((mz) => (
+                      <div key={mz.id} className="ml-4 space-y-1">
+                        <div
+                          onClick={() => selectPolygon(mz.id)}
+                          className={`p-2 rounded-lg cursor-pointer transition-colors border-l-4 border-green-500 ${
+                            selectedPolygonId === mz.id
+                              ? "bg-green-100 dark:bg-green-900/50"
+                              : "bg-gray-50 dark:bg-gray-800 hover:bg-gray-100 dark:hover:bg-gray-700"
+                          }`}
+                        >
+                          <div className="flex justify-between items-center">
+                            <span className="font-medium text-gray-900 dark:text-white text-sm">
+                              {mz.name}
+                            </span>
+                            <span className="text-xs text-gray-500">
+                              {formatMeasurement(mz.area, "m²")}
+                            </span>
+                          </div>
+                        </div>
+
+                        {/* SPs for this MZ */}
+                        {getSPsForMZ(mz.id).map((sp) => (
+                          <div
+                            key={sp.id}
+                            onClick={() => selectPolygon(sp.id)}
+                            className={`ml-4 p-2 rounded-lg cursor-pointer transition-colors border-l-4 border-amber-500 ${
+                              selectedPolygonId === sp.id
+                                ? "bg-amber-100 dark:bg-amber-900/50"
+                                : "bg-gray-50 dark:bg-gray-800 hover:bg-gray-100 dark:hover:bg-gray-700"
+                            }`}
+                          >
+                            <div className="flex justify-between items-center">
+                              <span className="font-medium text-gray-900 dark:text-white text-sm">
+                                {sp.name}
+                              </span>
+                              <span className="text-xs text-gray-500">
+                                {formatMeasurement(sp.area, "m²")}
+                              </span>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    ))}
                   </div>
                 ))}
               </div>
