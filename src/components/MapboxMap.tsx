@@ -3,10 +3,12 @@
 import { useRef, useEffect, useState, useCallback } from "react";
 import mapboxgl from "mapbox-gl";
 import MapboxDraw from "@mapbox/mapbox-gl-draw";
+import MapboxGeocoder from "@mapbox/mapbox-gl-geocoder";
 import * as turf from "@turf/turf";
 
 import "mapbox-gl/dist/mapbox-gl.css";
 import "@mapbox/mapbox-gl-draw/dist/mapbox-gl-draw.css";
+import "@mapbox/mapbox-gl-geocoder/dist/mapbox-gl-geocoder.css";
 
 interface PolygonMeasurement {
   id: string;
@@ -125,6 +127,19 @@ export default function MapboxMap({
 
     map.current.addControl(draw.current, "top-left");
     map.current.addControl(new mapboxgl.NavigationControl(), "top-right");
+
+    // Add Geocoder (search) control
+    const geocoder = new MapboxGeocoder({
+      accessToken: accessToken,
+      mapboxgl: mapboxgl,
+      marker: true,
+      placeholder: "Search address, place, or coordinates...",
+      zoom: 17,
+      // Include all location types for full address search
+      // Note: "address" includes street-level results, "poi.landmark" for famous landmarks
+      types: "country,region,postcode,district,place,locality,neighborhood,address,poi,poi.landmark",
+    });
+    map.current.addControl(geocoder, "top-left");
 
     // Event handlers
     map.current.on("draw.create", () => {
